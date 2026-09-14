@@ -2,7 +2,7 @@
 
 TLockGUI 是一个面向 Windows 10/11 x64、Qt 6.8.3 Widgets 和 MinGW 64-bit 的桌面前端。它不实现任何密码学；所有时间锁加密和解密均通过 `QProcess` 调用官方 `drand/tlock` `tle.exe`。
 
-当前首个公开版本为 **v1.0.0**。
+当前开发版本为 **v1.1.0**；首个公开版本为 **v1.0.0**。
 
 ## 安全边界
 
@@ -16,7 +16,8 @@ TLockGUI 是一个面向 Windows 10/11 x64、Qt 6.8.3 Widgets 和 MinGW 64-bit �
 
 ## 已实现功能
 
-- 加密/解密模式与顺序批处理，一次仅运行一个 `tle.exe`。
+- 加密/解密模式与并行批处理，可配置同时运行 1–8 个独立 `tle.exe`；默认并发数为 2。
+- 可取消表格中选中的运行中或等待中任务；“停止全部”会同时终止全部子进程并清理本次 `.part`。
 - 多文件选择、Explorer 拖拽、重复路径过滤、Delete 键移除。
 - 绝对解锁日期时间、当前时区和 10 分钟至 1 年快捷时间。
 - 每个加密任务真正开始前重新计算 `target - now`，生成 `-D <seconds>s`；目标到达后停止后续加密。
@@ -46,6 +47,7 @@ TLockGUI/
 ├── resources/
 ├── src/
 │   ├── main.cpp
+│   ├── AppTranslator.h/.cpp
 │   ├── MainWindow.h/.cpp
 │   ├── FileTask.h
 │   ├── TleRunner.h/.cpp
@@ -60,7 +62,7 @@ TLockGUI/
     └── OfficialTleIntegration.cpp
 ```
 
-`MainWindow` 负责界面、文件表、用户决策、设置和预检；`TaskQueue` 负责状态机、顺序调度、每项 duration、覆盖策略和安全落盘；`TleRunner` 独占一个 `QProcess` 并负责进程生命周期、日志与估算进度；`PowerManager` 封装 Windows 保持唤醒和计划关机；`HashWorker` 在后台流式计算 SHA-256；`Utils` 负责大小、时长、路径和输出命名等纯辅助逻辑。
+`MainWindow` 负责界面、文件表、用户决策、设置和预检；`TaskQueue` 负责并发状态机、调度、每项 duration、覆盖策略和安全落盘；每个活动任务拥有独立的 `TleRunner` 和 `QProcess`；`PowerManager` 封装 Windows 保持唤醒和计划关机；`HashWorker` 在后台流式计算 SHA-256；`AppTranslator` 提供完整英语文本；`Utils` 负责大小、时长、路径和输出命名等纯辅助逻辑。
 
 ## 电源选项
 
@@ -70,7 +72,11 @@ TLockGUI/
 
 ## CPU 利用率说明
 
-TLockGUI 默认一次只运行一个 `tle.exe`，GUI 本身只轮询文件元数据，因此总 CPU 利用率较低通常是正常现象。任务管理器的总百分比按全部逻辑处理器平均：例如 12 个逻辑处理器上的约 8% 已接近一个逻辑核心满载。判断性能时应同时查看 `tle.exe` 的单进程/单核占用、源盘与目标盘吞吐和实际 MiB/s；为避免多个 10–20GB 文件争用磁盘，本项目不会通过并行运行多个 `tle.exe` 来追求更高总 CPU。
+任务管理器的总百分比按全部逻辑处理器平均：例如 12 个逻辑处理器上的约 8% 已接近一个逻辑核心满载。v1.1.0 默认并行运行最多 2 个 `tle.exe`，可在高级设置中调整为 1–8。并发提高后 CPU 利用率通常会上升，但实际速度仍可能受磁盘或网络限制；机械硬盘建议使用 1，SSD 建议从 2 开始，根据吞吐和温度逐步调整。
+
+## 界面语言
+
+界面右上角可选择“简体中文”或“English”。语言设置会保存到 QSettings，并在重新启动 TLockGUI 后应用。英语模式覆盖界面、任务状态、日志、错误提示、电源选项和覆盖确认等用户可见文本。
 
 ## Qt Creator 编译
 
@@ -100,7 +106,7 @@ cmake --build build-release -j
 
 ## 测试
 
-普通自动化测试使用一个仅复制数据的测试替身验证队列，不模拟或替代任何密码学：
+普通自动化测试使用一个仅复制数据的测试替身验证并发上限、并行完成/停止、英语翻译和安全队列；它不模拟或替代任何密码学：
 
 ```powershell
 ctest --test-dir build --output-on-failure
@@ -128,7 +134,8 @@ Copy-Item C:\tlock\tle.exe dist\TLockGUI\tle.exe
 ## 已知限制
 
 - `tle.exe` 没有进度 API，界面百分比、速度和 ETA 都是基于 `.part` 大小的近似值，解密时可能不线性。
-- 第一版不提供暂停/恢复、并行 tle 任务、自动删除输入文件、armor、SHA-256 清单导出或批量任务恢复。
+- 当前版本不提供暂停/恢复、自动删除输入文件、armor、SHA-256 清单导出或批量任务恢复。
+- 更改界面语言后需要重新启动程序；运行期间语言选择会锁定。
 - `--metadata` 和正式操作依赖 drand 网络；代理、防火墙或网络不可用会使验证/任务失败。
 - 超长路径最终能否工作还取决于 Windows 的长路径策略以及官方 Go 可执行文件；Qt 侧始终保留 Unicode `QString` 路径。
 - 批量磁盘估算有意偏保守，实际 tlock 密文大小可能与输入略有差异。

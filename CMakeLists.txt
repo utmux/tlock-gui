@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.21)
 
 project(TLockGUI
-    VERSION 1.0.0
+    VERSION 1.1.0
     LANGUAGES CXX
 )
 
@@ -23,6 +23,8 @@ qt_standard_project_setup()
 
 qt_add_executable(TLockGUI WIN32
     src/main.cpp
+    src/AppTranslator.h
+    src/AppTranslator.cpp
     src/MainWindow.h
     src/MainWindow.cpp
     src/FileTask.h
@@ -62,6 +64,8 @@ if(BUILD_TESTING)
 
     qt_add_executable(TLockGUITests
         tests/TestMain.cpp
+        src/AppTranslator.h
+        src/AppTranslator.cpp
         src/FileTask.h
         src/TleRunner.h
         src/TleRunner.cpp
@@ -100,6 +104,8 @@ if(BUILD_TESTING)
 
     qt_add_executable(TLockGUISmoke
         tests/GuiSmoke.cpp
+        src/AppTranslator.h
+        src/AppTranslator.cpp
         src/MainWindow.h
         src/MainWindow.cpp
         src/FileTask.h

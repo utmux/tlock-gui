@@ -23,7 +23,7 @@ void TleRunner::start(const QString &program, const QStringList &arguments,
                       const QString &tempOutputPath, qint64 inputSize)
 {
     if (isRunning()) {
-        emit finished(false, false, -1, QStringLiteral("内部错误：已有 tle.exe 进程正在运行。"));
+        emit finished(false, false, -1, tr("内部错误：已有 tle.exe 进程正在运行。"));
         return;
     }
 
@@ -65,7 +65,7 @@ void TleRunner::start(const QString &program, const QStringList &arguments,
     connect(process, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
         if (error != QProcess::FailedToStart || m_resultEmitted || !m_process)
             return;
-        const QString message = QStringLiteral("tle.exe 启动失败：%1").arg(m_process->errorString());
+        const QString message = tr("tle.exe 启动失败：%1").arg(m_process->errorString());
         QTimer::singleShot(0, this, [this, message]() { completeStartFailure(message); });
     });
     connect(process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished),
@@ -182,9 +182,9 @@ void TleRunner::complete(int exitCode, QProcess::ExitStatus exitStatus)
         diagnostic += QString::fromUtf8(m_standardError);
     }
     if (exitStatus == QProcess::CrashExit && !m_cancelRequested)
-        diagnostic += QStringLiteral("\ntle.exe 异常终止。");
+        diagnostic += tr("\ntle.exe 异常终止。");
     if (exitStatus == QProcess::NormalExit && exitCode == 0 && !outputValid && !m_cancelRequested)
-        diagnostic += QStringLiteral("\ntle.exe 返回成功，但临时输出文件不存在或为空。");
+        diagnostic += tr("\ntle.exe 返回成功，但临时输出文件不存在或为空。");
 
     QPointer<QProcess> completedProcess = m_process;
     m_process = nullptr;

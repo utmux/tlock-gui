@@ -13,7 +13,7 @@ void HashWorker::calculate(const QString &path)
 {
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly)) {
-        emit finished(path, {}, QStringLiteral("无法读取文件：%1").arg(file.errorString()));
+        emit finished(path, {}, tr("无法读取文件：%1").arg(file.errorString()));
         return;
     }
 
@@ -27,13 +27,13 @@ void HashWorker::calculate(const QString &path)
 
     while (!file.atEnd()) {
         if (m_cancelled.load(std::memory_order_relaxed)) {
-            emit finished(path, {}, QStringLiteral("SHA-256 计算已取消。"));
+            emit finished(path, {}, tr("SHA-256 计算已取消。"));
             return;
         }
 
         const qint64 bytesRead = file.read(buffer.data(), buffer.size());
         if (bytesRead < 0) {
-            emit finished(path, {}, QStringLiteral("读取文件失败：%1").arg(file.errorString()));
+            emit finished(path, {}, tr("读取文件失败：%1").arg(file.errorString()));
             return;
         }
         if (bytesRead == 0)

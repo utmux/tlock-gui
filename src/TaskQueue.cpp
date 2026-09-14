@@ -10,6 +10,7 @@
 #include <QTimer>
 #include <QUuid>
 
+#include <algorithm>
 #include <limits>
 
 namespace {
@@ -21,79 +22,17 @@ qint64 saturatedAdd(qint64 left, qint64 right)
         return std::numeric_limits<qint64>::max();
     return left + right;
 }
+
+bool isTerminal(TaskStatus status)
+{
+    return status == TaskStatus::Success || status == TaskStatus::Failed
+        || status == TaskStatus::Skipped || status == TaskStatus::Cancelled;
+}
 }
 
 TaskQueue::TaskQueue(QObject *parent)
     : QObject(parent)
-    , m_runner(new TleRunner(this))
 {
-    connect(m_runner, &TleRunner::outputReceived, this,
-            [this](const QString &text, bool standardError) {
-        const QString channel = standardError ? QStringLiteral("stderr") : QStringLiteral("stdout");
-        const QString trimmed = text.trimmed();
-        if (!trimmed.isEmpty())
-            emit logMessage(QStringLiteral("[%1]\n%2").arg(channel, trimmed));
-    });
-
-    connect(m_runner, &TleRunner::progress, this,
-            [this](qint64 bytes, int percent, double speed, qint64 elapsed, qint64 eta) {
-        if (!m_running || m_currentIndex < 0 || m_currentIndex >= m_tasks.size())
-            return;
-        FileTask &task = m_tasks[m_currentIndex];
-        task.outputBytes = bytes;
-        task.progress = percent;
-        emit taskChanged(m_currentIndex, task);
-        emit currentProgress(m_currentIndex, bytes, percent, speed, elapsed, eta);
-        refreshTotalProgress(bytes);
-    });
-
-    connect(m_runner, &TleRunner::finished, this,
-            [this](bool processSucceeded, bool cancelled, int exitCode, const QString &diagnostic) {
-        if (!m_running || m_currentIndex < 0 || m_currentIndex >= m_tasks.size())
-            return;
-
-        FileTask &task = m_tasks[m_currentIndex];
-        emit logMessage(QStringLiteral("tle.exe 已退出，退出代码：%1").arg(exitCode));
-        if (!diagnostic.isEmpty())
-            emit logMessage(QStringLiteral("进程诊断信息：\n%1").arg(diagnostic));
-
-        if (cancelled) {
-            cleanTemporaryOutput(task.tempOutputPath);
-            setStatus(m_currentIndex, TaskStatus::Cancelled, QStringLiteral("用户取消了当前任务。"));
-            emit logMessage(QStringLiteral("已取消：%1").arg(task.inputPath));
-        } else if (processSucceeded) {
-            QString finalizeError;
-            if (finalizeOutput(task, m_currentOverwriteAllowed, &finalizeError)) {
-                task.progress = 100;
-                task.outputBytes = QFileInfo(task.finalOutputPath).size();
-                task.status = TaskStatus::Success;
-                task.errorMessage.clear();
-                m_successfulBytes = saturatedAdd(m_successfulBytes, task.inputSize);
-                emit taskChanged(m_currentIndex, task);
-                emit currentProgress(m_currentIndex, task.outputBytes, 100, 0.0,
-                                     0, 0);
-                emit logMessage(QStringLiteral("成功：%1\n输出：%2")
-                                    .arg(task.inputPath, task.finalOutputPath));
-            } else {
-                cleanTemporaryOutput(task.tempOutputPath);
-                setStatus(m_currentIndex, TaskStatus::Failed, finalizeError);
-                emit logMessage(QStringLiteral("安全保存失败：%1").arg(finalizeError));
-            }
-        } else {
-            cleanTemporaryOutput(task.tempOutputPath);
-            const QString failure = friendlyFailure(diagnostic, exitCode);
-            setStatus(m_currentIndex, TaskStatus::Failed, failure);
-            emit logMessage(QStringLiteral("失败：%1").arg(failure));
-        }
-
-        refreshTotalProgress();
-        m_currentOverwriteAllowed = false;
-        if (m_stopRequested) {
-            finishBatch();
-            return;
-        }
-        QTimer::singleShot(0, this, &TaskQueue::startNext);
-    });
 }
 
 TaskQueue::~TaskQueue()
@@ -108,7 +47,22 @@ bool TaskQueue::isRunning() const
 
 int TaskQueue::currentIndex() const
 {
-    return m_currentIndex;
+    return m_lastStartedIndex;
+}
+
+int TaskQueue::activeCount() const
+{
+    return m_activeTasks.size();
+}
+
+QVector<int> TaskQueue::activeTaskIndices() const
+{
+    QVector<int> indices;
+    indices.reserve(m_taskRunners.size());
+    for (auto iterator = m_taskRunners.constBegin(); iterator != m_taskRunners.constEnd(); ++iterator)
+        indices.append(iterator.key());
+    std::sort(indices.begin(), indices.end());
+    return indices;
 }
 
 const QVector<FileTask> &TaskQueue::tasks() const
@@ -123,12 +77,17 @@ void TaskQueue::start(const QVector<FileTask> &tasks, const BatchSettings &setti
 
     m_tasks = tasks;
     m_settings = settings;
-    m_currentIndex = -1;
-    m_waitingForExistingDecision = false;
+    m_settings.maxParallelTasks = qBound(1, m_settings.maxParallelTasks, 32);
+    m_activeTasks.clear();
+    m_taskRunners.clear();
+    m_nextIndex = 0;
+    m_lastStartedIndex = -1;
+    m_waitingDecisionIndex = -1;
     m_stopRequested = false;
+    m_stoppedByUser = false;
+    m_abortScheduling = false;
     m_overwriteAll = false;
     m_skipAll = false;
-    m_currentOverwriteAllowed = false;
     m_totalBytes = 0;
     m_successfulBytes = 0;
     for (FileTask &task : m_tasks) {
@@ -141,22 +100,48 @@ void TaskQueue::start(const QVector<FileTask> &tasks, const BatchSettings &setti
 
     m_running = true;
     emit runningChanged(true);
+    emit activeCountChanged(0, m_settings.maxParallelTasks);
     refreshTotalProgress();
-    QTimer::singleShot(0, this, &TaskQueue::startNext);
+    QTimer::singleShot(0, this, &TaskQueue::schedule);
 }
 
 void TaskQueue::cancelCurrent()
 {
     if (!m_running)
         return;
-    if (m_waitingForExistingDecision) {
-        skipCurrent();
+    if (m_taskRunners.contains(m_lastStartedIndex)) {
+        cancelTask(m_lastStartedIndex);
         return;
     }
-    if (m_runner->isRunning()) {
-        emit logMessage(QStringLiteral("正在取消当前任务；将先请求进程正常终止，2 秒后仍未退出则强制结束。"));
-        m_runner->cancel();
+    const QVector<int> active = activeTaskIndices();
+    if (!active.isEmpty()) {
+        cancelTask(active.constFirst());
+        return;
     }
+    if (m_waitingDecisionIndex >= 0)
+        cancelTask(m_waitingDecisionIndex);
+}
+
+void TaskQueue::cancelTask(int index)
+{
+    if (!m_running || index < 0 || index >= m_tasks.size())
+        return;
+
+    if (TleRunner *runner = m_taskRunners.value(index, nullptr)) {
+        emit logMessage(tr("正在取消任务 %1；将先请求进程正常终止，2 秒后仍未退出则强制结束。")
+                            .arg(index + 1));
+        runner->cancel();
+        return;
+    }
+
+    if (m_tasks[index].status != TaskStatus::Pending)
+        return;
+    if (m_waitingDecisionIndex == index)
+        m_waitingDecisionIndex = -1;
+    setStatus(index, TaskStatus::Cancelled, tr("用户取消了该任务。"));
+    emit logMessage(tr("已取消：%1").arg(m_tasks[index].inputPath));
+    refreshTotalProgress();
+    QTimer::singleShot(0, this, &TaskQueue::schedule);
 }
 
 void TaskQueue::stopAll()
@@ -164,178 +149,189 @@ void TaskQueue::stopAll()
     if (!m_running)
         return;
     m_stopRequested = true;
-    markRemainingCancelled(m_currentIndex + 1);
+    m_stoppedByUser = true;
+    m_abortScheduling = true;
 
-    if (m_waitingForExistingDecision) {
-        m_waitingForExistingDecision = false;
-        if (m_currentIndex >= 0 && m_currentIndex < m_tasks.size())
-            setStatus(m_currentIndex, TaskStatus::Cancelled, QStringLiteral("用户停止了批处理。"));
-        finishBatch();
-    } else if (m_runner->isRunning()) {
-        emit logMessage(QStringLiteral("正在停止全部任务。"));
-        m_runner->cancel();
-    } else {
-        if (m_currentIndex >= 0 && m_currentIndex < m_tasks.size()
-            && m_tasks[m_currentIndex].status == TaskStatus::Pending) {
-            setStatus(m_currentIndex, TaskStatus::Cancelled, QStringLiteral("用户停止了批处理。"));
-        }
-        finishBatch();
+    if (m_waitingDecisionIndex >= 0) {
+        setStatus(m_waitingDecisionIndex, TaskStatus::Cancelled, tr("用户停止了批处理。"));
+        m_waitingDecisionIndex = -1;
     }
+    markRemainingCancelled(0);
+
+    const QList<TleRunner *> runners = m_activeTasks.keys();
+    if (!runners.isEmpty())
+        emit logMessage(tr("正在停止全部 %1 个运行中的任务。").arg(runners.size()));
+    for (TleRunner *runner : runners)
+        runner->cancel();
+    maybeFinish();
 }
 
 void TaskQueue::resolveExistingTarget(ExistingTargetDecision decision)
 {
-    if (!m_running || !m_waitingForExistingDecision)
+    if (!m_running || m_waitingDecisionIndex < 0)
         return;
-    m_waitingForExistingDecision = false;
+    const int index = m_waitingDecisionIndex;
+    m_waitingDecisionIndex = -1;
 
     switch (decision) {
     case ExistingTargetDecision::OverwriteAll:
         m_overwriteAll = true;
-        m_currentOverwriteAllowed = true;
-        startCurrent();
+        startTask(index, true);
         break;
     case ExistingTargetDecision::Overwrite:
-        m_currentOverwriteAllowed = true;
-        startCurrent();
+        startTask(index, true);
         break;
     case ExistingTargetDecision::SkipAll:
         m_skipAll = true;
-        skipCurrent();
+        skipTask(index);
         break;
     case ExistingTargetDecision::Skip:
-        skipCurrent();
+        skipTask(index);
         break;
     case ExistingTargetDecision::CancelAll:
-        m_stopRequested = true;
-        setStatus(m_currentIndex, TaskStatus::Cancelled, QStringLiteral("用户取消了批处理。"));
-        markRemainingCancelled(m_currentIndex + 1);
-        finishBatch();
-        break;
+        setStatus(index, TaskStatus::Cancelled, tr("用户取消了批处理。"));
+        stopAll();
+        return;
     }
+    refreshTotalProgress();
+    QTimer::singleShot(0, this, &TaskQueue::schedule);
 }
 
 void TaskQueue::forceShutdown()
 {
-    if (!m_running && !m_runner->isRunning())
+    if (!m_running && m_activeTasks.isEmpty())
         return;
 
     m_stopRequested = true;
-    m_runner->forceStopAndWait();
-    if (m_currentIndex >= 0 && m_currentIndex < m_tasks.size()) {
-        FileTask &task = m_tasks[m_currentIndex];
-        cleanTemporaryOutput(task.tempOutputPath);
-        if (task.status == TaskStatus::Encrypting || task.status == TaskStatus::Decrypting
-            || task.status == TaskStatus::Pending) {
-            task.status = TaskStatus::Cancelled;
-            task.errorMessage = QStringLiteral("程序退出时任务被终止。");
-            emit taskChanged(m_currentIndex, task);
-        }
+    m_stoppedByUser = true;
+    m_abortScheduling = true;
+    if (m_waitingDecisionIndex >= 0) {
+        setStatus(m_waitingDecisionIndex, TaskStatus::Cancelled, tr("程序退出时任务被终止。"));
+        m_waitingDecisionIndex = -1;
     }
-    markRemainingCancelled(m_currentIndex + 1);
+
+    const QList<TleRunner *> runners = m_activeTasks.keys();
+    for (TleRunner *runner : runners) {
+        const ActiveTask active = m_activeTasks.value(runner);
+        runner->forceStopAndWait();
+        if (active.index >= 0 && active.index < m_tasks.size()) {
+            FileTask &task = m_tasks[active.index];
+            cleanTemporaryOutput(task.tempOutputPath);
+            if (!isTerminal(task.status))
+                setStatus(active.index, TaskStatus::Cancelled, tr("程序退出时任务被终止。"));
+        }
+        runner->deleteLater();
+    }
+    m_activeTasks.clear();
+    m_taskRunners.clear();
+    emit activeCountChanged(0, m_settings.maxParallelTasks);
+    markRemainingCancelled(0);
     if (m_running)
         finishBatch();
 }
 
-void TaskQueue::startNext()
+void TaskQueue::schedule()
 {
     if (!m_running)
         return;
-    if (m_stopRequested) {
-        finishBatch();
+    if (m_stopRequested || m_abortScheduling) {
+        maybeFinish();
         return;
     }
 
-    ++m_currentIndex;
-    if (m_currentIndex >= m_tasks.size()) {
-        finishBatch();
-        return;
+    while (m_running && !m_stopRequested && !m_abortScheduling
+           && m_waitingDecisionIndex < 0
+           && m_activeTasks.size() < m_settings.maxParallelTasks
+           && m_nextIndex < m_tasks.size()) {
+        const int index = m_nextIndex++;
+        if (m_tasks[index].status != TaskStatus::Pending)
+            continue;
+        if (!prepareTask(index))
+            break;
     }
+    maybeFinish();
+}
 
-    FileTask &task = m_tasks[m_currentIndex];
-    emit currentTaskChanged(task.inputPath, m_currentIndex + 1, m_tasks.size());
-    refreshTotalProgress();
-
+bool TaskQueue::prepareTask(int index)
+{
+    FileTask &task = m_tasks[index];
     const QFileInfo inputInfo(task.inputPath);
     if (!inputInfo.exists() || !inputInfo.isFile()) {
-        setStatus(m_currentIndex, TaskStatus::Failed,
-                  QStringLiteral("输入文件不存在或不是普通文件：%1").arg(task.inputPath));
-        QTimer::singleShot(0, this, &TaskQueue::startNext);
-        return;
+        setStatus(index, TaskStatus::Failed,
+                  tr("输入文件不存在或不是普通文件：%1").arg(task.inputPath));
+        return true;
     }
     if (inputInfo.size() <= 0) {
-        setStatus(m_currentIndex, TaskStatus::Failed,
-                  QStringLiteral("输入文件为空，未启动 tle.exe：%1").arg(task.inputPath));
-        QTimer::singleShot(0, this, &TaskQueue::startNext);
-        return;
+        setStatus(index, TaskStatus::Failed,
+                  tr("输入文件为空，未启动 tle.exe：%1").arg(task.inputPath));
+        return true;
     }
     if (inputInfo.size() != task.inputSize) {
         m_totalBytes -= task.inputSize;
         task.inputSize = inputInfo.size();
         m_totalBytes = saturatedAdd(m_totalBytes, task.inputSize);
-        emit taskChanged(m_currentIndex, task);
+        emit taskChanged(index, task);
     }
 
     if (m_settings.mode == TaskMode::Encrypt
         && QDateTime::currentDateTime().secsTo(m_settings.unlockTarget) <= 0) {
-        const QString message = QStringLiteral("目标解锁时间已经到达或过去，无法继续生成时间锁文件。");
-        setStatus(m_currentIndex, TaskStatus::Failed, message);
-        markRemainingCancelled(m_currentIndex + 1);
+        const QString message = tr("目标解锁时间已经到达或过去，无法继续生成时间锁文件。");
+        setStatus(index, TaskStatus::Failed, message);
+        markRemainingCancelled(m_nextIndex);
+        m_abortScheduling = true;
         emit fatalError(message);
-        finishBatch();
-        return;
+        return false;
     }
 
     const QString outputDirectory = QFileInfo(task.finalOutputPath).absolutePath();
     QString writableError;
     if (!Utils::isPathWritableDirectory(outputDirectory, &writableError)) {
-        setStatus(m_currentIndex, TaskStatus::Failed, writableError);
-        QTimer::singleShot(0, this, &TaskQueue::startNext);
-        return;
+        setStatus(index, TaskStatus::Failed, writableError);
+        return true;
     }
 
     const QStorageInfo storage(outputDirectory);
     if (storage.isValid() && storage.isReady()
         && storage.bytesAvailable() <= saturatedAdd(task.inputSize, safetyMargin)) {
-        const QString message = QStringLiteral("输出磁盘空间不足。至少需要 %1，可用 %2。")
+        const QString message = tr("输出磁盘空间不足。至少需要 %1，可用 %2。")
             .arg(Utils::formatBytes(saturatedAdd(task.inputSize, safetyMargin)),
                  Utils::formatBytes(storage.bytesAvailable()));
-        setStatus(m_currentIndex, TaskStatus::Failed, message);
-        QTimer::singleShot(0, this, &TaskQueue::startNext);
-        return;
+        setStatus(index, TaskStatus::Failed, message);
+        return true;
     }
 
     if (QFileInfo::exists(task.finalOutputPath)) {
         if (m_skipAll) {
-            skipCurrent();
-            return;
+            skipTask(index);
+            return true;
         }
         if (m_overwriteAll) {
-            m_currentOverwriteAllowed = true;
-            startCurrent();
-            return;
+            startTask(index, true);
+            return true;
         }
-        m_waitingForExistingDecision = true;
-        emit existingTargetFound(m_currentIndex, task.finalOutputPath);
+        m_waitingDecisionIndex = index;
+        emit existingTargetFound(index, task.finalOutputPath);
+        return false;
+    }
+
+    startTask(index, false);
+    return true;
+}
+
+void TaskQueue::startTask(int index, bool overwriteAllowed)
+{
+    if (!m_running || m_stopRequested || m_abortScheduling
+        || index < 0 || index >= m_tasks.size()
+        || m_tasks[index].status != TaskStatus::Pending) {
         return;
     }
 
-    m_currentOverwriteAllowed = false;
-    startCurrent();
-}
-
-void TaskQueue::startCurrent()
-{
-    if (!m_running || m_currentIndex < 0 || m_currentIndex >= m_tasks.size())
-        return;
-
-    FileTask &task = m_tasks[m_currentIndex];
+    FileTask &task = m_tasks[index];
     if (QFileInfo::exists(task.tempOutputPath)) {
-        setStatus(m_currentIndex, TaskStatus::Failed,
-                  QStringLiteral("临时输出路径已存在。为保护现有数据，未覆盖该文件：%1\n"
-                                 "请确认后手动移动或删除它，再重试。")
+        setStatus(index, TaskStatus::Failed,
+                  tr("临时输出路径已存在。为保护现有数据，未覆盖该文件：%1\n"
+                     "请确认后手动移动或删除它，再重试。")
                       .arg(task.tempOutputPath));
-        QTimer::singleShot(0, this, &TaskQueue::startNext);
         return;
     }
 
@@ -343,25 +339,25 @@ void TaskQueue::startCurrent()
     if (m_settings.mode == TaskMode::Encrypt) {
         const qint64 seconds = QDateTime::currentDateTime().secsTo(m_settings.unlockTarget);
         if (seconds <= 0) {
-            const QString message = QStringLiteral("目标解锁时间已经到达或过去，无法继续生成时间锁文件。");
-            setStatus(m_currentIndex, TaskStatus::Failed, message);
-            markRemainingCancelled(m_currentIndex + 1);
+            const QString message = tr("目标解锁时间已经到达或过去，无法继续生成时间锁文件。");
+            setStatus(index, TaskStatus::Failed, message);
+            markRemainingCancelled(m_nextIndex);
+            m_abortScheduling = true;
             emit fatalError(message);
-            finishBatch();
             return;
         }
         arguments << QStringLiteral("-e")
                   << QStringLiteral("-D")
                   << QString::number(seconds) + QStringLiteral("s");
-        setStatus(m_currentIndex, TaskStatus::Encrypting);
-        emit logMessage(QStringLiteral("开始加密：%1").arg(task.inputPath));
-        emit logMessage(QStringLiteral("Unlock target: %1\nRemaining: %2s")
+        setStatus(index, TaskStatus::Encrypting);
+        emit logMessage(tr("开始加密 [%1/%2]：%3").arg(index + 1).arg(m_tasks.size()).arg(task.inputPath));
+        emit logMessage(tr("解锁目标：%1\n剩余：%2 秒")
                             .arg(m_settings.unlockTarget.toString(QStringLiteral("yyyy-MM-dd HH:mm:ss")))
                             .arg(seconds));
     } else {
         arguments << QStringLiteral("-d");
-        setStatus(m_currentIndex, TaskStatus::Decrypting);
-        emit logMessage(QStringLiteral("开始解密：%1").arg(task.inputPath));
+        setStatus(index, TaskStatus::Decrypting);
+        emit logMessage(tr("开始解密 [%1/%2]：%3").arg(index + 1).arg(m_tasks.size()).arg(task.inputPath));
     }
 
     if (!m_settings.useDefaultNetwork) {
@@ -370,30 +366,120 @@ void TaskQueue::startCurrent()
     }
     arguments << QStringLiteral("-o") << task.tempOutputPath << task.inputPath;
 
-    emit logMessage(QStringLiteral("Program:\n%1\nArguments:\n%2")
+    auto *runner = new TleRunner(this);
+    m_activeTasks.insert(runner, {index, overwriteAllowed});
+    m_taskRunners.insert(index, runner);
+    m_lastStartedIndex = index;
+
+    connect(runner, &TleRunner::outputReceived, this,
+            [this, runner](const QString &text, bool standardError) {
+        if (!m_activeTasks.contains(runner))
+            return;
+        const int taskIndex = m_activeTasks.value(runner).index;
+        const QString channel = standardError ? QStringLiteral("stderr") : QStringLiteral("stdout");
+        const QString trimmed = text.trimmed();
+        if (!trimmed.isEmpty())
+            emit logMessage(QStringLiteral("[%1/%2][%3]\n%4")
+                                .arg(taskIndex + 1).arg(m_tasks.size()).arg(channel, trimmed));
+    });
+    connect(runner, &TleRunner::progress, this,
+            [this, runner](qint64 bytes, int percent, double speed, qint64 elapsed, qint64 eta) {
+        if (!m_running || !m_activeTasks.contains(runner))
+            return;
+        const int taskIndex = m_activeTasks.value(runner).index;
+        FileTask &runningTask = m_tasks[taskIndex];
+        runningTask.outputBytes = bytes;
+        runningTask.progress = percent;
+        emit taskChanged(taskIndex, runningTask);
+        emit currentProgress(taskIndex, bytes, percent, speed, elapsed, eta);
+        refreshTotalProgress();
+    });
+    connect(runner, &TleRunner::finished, this,
+            [this, runner](bool succeeded, bool cancelled, int exitCode, const QString &diagnostic) {
+        handleRunnerFinished(runner, succeeded, cancelled, exitCode, diagnostic);
+    });
+
+    emit currentTaskChanged(task.inputPath, index + 1, m_tasks.size());
+    emit activeCountChanged(m_activeTasks.size(), m_settings.maxParallelTasks);
+    emit logMessage(tr("程序：\n%1\n参数：\n%2")
                         .arg(m_settings.tlePath, arguments.join(QLatin1Char('\n'))));
-    m_runner->start(m_settings.tlePath, arguments, task.tempOutputPath, task.inputSize);
+    runner->start(m_settings.tlePath, arguments, task.tempOutputPath, task.inputSize);
 }
 
-void TaskQueue::skipCurrent()
+void TaskQueue::skipTask(int index)
 {
-    if (m_currentIndex < 0 || m_currentIndex >= m_tasks.size())
+    if (index < 0 || index >= m_tasks.size())
         return;
-    setStatus(m_currentIndex, TaskStatus::Skipped, QStringLiteral("目标文件已存在，已按用户选择跳过。"));
-    emit logMessage(QStringLiteral("已跳过：%1").arg(m_tasks[m_currentIndex].inputPath));
+    setStatus(index, TaskStatus::Skipped, tr("目标文件已存在，已按用户选择跳过。"));
+    emit logMessage(tr("已跳过：%1").arg(m_tasks[index].inputPath));
+}
+
+void TaskQueue::handleRunnerFinished(TleRunner *runner, bool processSucceeded,
+                                     bool cancelled, int exitCode, const QString &diagnostic)
+{
+    if (!m_activeTasks.contains(runner))
+        return;
+    const ActiveTask active = m_activeTasks.take(runner);
+    m_taskRunners.remove(active.index);
+    emit activeCountChanged(m_activeTasks.size(), m_settings.maxParallelTasks);
+
+    FileTask &task = m_tasks[active.index];
+    emit logMessage(tr("tle.exe [%1/%2] 已退出，退出代码：%3")
+                        .arg(active.index + 1).arg(m_tasks.size()).arg(exitCode));
+    if (!diagnostic.isEmpty())
+        emit logMessage(tr("进程诊断信息：\n%1").arg(diagnostic));
+
+    if (cancelled) {
+        cleanTemporaryOutput(task.tempOutputPath);
+        setStatus(active.index, TaskStatus::Cancelled,
+                  m_stopRequested ? tr("用户停止了批处理。") : tr("用户取消了该任务。"));
+        emit logMessage(tr("已取消：%1").arg(task.inputPath));
+    } else if (processSucceeded) {
+        QString finalizeError;
+        if (finalizeOutput(task, active.overwriteAllowed, &finalizeError)) {
+            task.progress = 100;
+            task.outputBytes = QFileInfo(task.finalOutputPath).size();
+            task.status = TaskStatus::Success;
+            task.errorMessage.clear();
+            m_successfulBytes = saturatedAdd(m_successfulBytes, task.inputSize);
+            emit taskChanged(active.index, task);
+            emit currentProgress(active.index, task.outputBytes, 100, 0.0, 0, 0);
+            emit logMessage(tr("成功：%1\n输出：%2").arg(task.inputPath, task.finalOutputPath));
+        } else {
+            cleanTemporaryOutput(task.tempOutputPath);
+            setStatus(active.index, TaskStatus::Failed, finalizeError);
+            emit logMessage(tr("安全保存失败：%1").arg(finalizeError));
+        }
+    } else {
+        cleanTemporaryOutput(task.tempOutputPath);
+        const QString failure = friendlyFailure(diagnostic, exitCode);
+        setStatus(active.index, TaskStatus::Failed, failure);
+        emit logMessage(tr("失败：%1").arg(failure));
+    }
+
+    runner->deleteLater();
     refreshTotalProgress();
-    QTimer::singleShot(0, this, &TaskQueue::startNext);
+    QTimer::singleShot(0, this, &TaskQueue::schedule);
+}
+
+void TaskQueue::maybeFinish()
+{
+    if (!m_running || !m_activeTasks.isEmpty() || m_waitingDecisionIndex >= 0)
+        return;
+    if (m_stopRequested || m_abortScheduling || m_nextIndex >= m_tasks.size())
+        finishBatch();
 }
 
 void TaskQueue::finishBatch()
 {
-    if (!m_running)
+    if (!m_running || !m_activeTasks.isEmpty())
         return;
     m_running = false;
-    m_waitingForExistingDecision = false;
+    m_waitingDecisionIndex = -1;
     refreshTotalProgress();
+    emit activeCountChanged(0, m_settings.maxParallelTasks);
     emit runningChanged(false);
-    emit batchFinished(m_stopRequested);
+    emit batchFinished(m_stoppedByUser);
 }
 
 void TaskQueue::setStatus(int index, TaskStatus status, const QString &error)
@@ -410,7 +496,7 @@ void TaskQueue::markRemainingCancelled(int firstIndex)
 {
     for (int index = qMax(0, firstIndex); index < m_tasks.size(); ++index) {
         if (m_tasks[index].status == TaskStatus::Pending)
-            setStatus(index, TaskStatus::Cancelled, QStringLiteral("批处理已停止。"));
+            setStatus(index, TaskStatus::Cancelled, tr("批处理已停止。"));
     }
 }
 
@@ -419,26 +505,26 @@ void TaskQueue::cleanTemporaryOutput(const QString &path)
     if (path.isEmpty() || !QFileInfo::exists(path))
         return;
     if (!QFile::remove(path))
-        emit logMessage(QStringLiteral("警告：无法删除临时文件，请手动处理：%1").arg(path));
+        emit logMessage(tr("警告：无法删除临时文件，请手动处理：%1").arg(path));
 }
 
 bool TaskQueue::finalizeOutput(FileTask &task, bool overwriteAllowed, QString *errorMessage)
 {
     const QFileInfo tempInfo(task.tempOutputPath);
     if (!tempInfo.exists() || !tempInfo.isFile() || tempInfo.size() <= 0) {
-        *errorMessage = QStringLiteral("临时输出不存在或为空：%1").arg(task.tempOutputPath);
+        *errorMessage = tr("临时输出不存在或为空：%1").arg(task.tempOutputPath);
         return false;
     }
 
     const bool targetExists = QFileInfo::exists(task.finalOutputPath);
     if (targetExists && !overwriteAllowed) {
-        *errorMessage = QStringLiteral("处理期间目标文件出现，为保护数据未覆盖：%1").arg(task.finalOutputPath);
+        *errorMessage = tr("处理期间目标文件出现，为保护数据未覆盖：%1").arg(task.finalOutputPath);
         return false;
     }
 
     if (!targetExists) {
         if (!QFile::rename(task.tempOutputPath, task.finalOutputPath)) {
-            *errorMessage = QStringLiteral("无法将临时文件重命名为最终文件：%1").arg(task.finalOutputPath);
+            *errorMessage = tr("无法将临时文件重命名为最终文件：%1").arg(task.finalOutputPath);
             return false;
         }
         return true;
@@ -448,56 +534,58 @@ bool TaskQueue::finalizeOutput(FileTask &task, bool overwriteAllowed, QString *e
         + QStringLiteral(".tlockgui-backup-")
         + QUuid::createUuid().toString(QUuid::WithoutBraces);
     if (!QFile::rename(task.finalOutputPath, backupPath)) {
-        *errorMessage = QStringLiteral("无法暂存已有目标文件，原文件保持不变：%1").arg(task.finalOutputPath);
+        *errorMessage = tr("无法暂存已有目标文件，原文件保持不变：%1").arg(task.finalOutputPath);
         return false;
     }
 
     if (!QFile::rename(task.tempOutputPath, task.finalOutputPath)) {
         const bool restored = QFile::rename(backupPath, task.finalOutputPath);
         *errorMessage = restored
-            ? QStringLiteral("新文件重命名失败；已有目标文件已恢复。")
-            : QStringLiteral("新文件重命名失败，并且旧文件恢复失败。旧文件保存在：%1").arg(backupPath);
+            ? tr("新文件重命名失败；已有目标文件已恢复。")
+            : tr("新文件重命名失败，并且旧文件恢复失败。旧文件保存在：%1").arg(backupPath);
         return false;
     }
 
     if (!QFile::remove(backupPath))
-        emit logMessage(QStringLiteral("警告：新文件已保存，但旧文件备份未能删除：%1").arg(backupPath));
+        emit logMessage(tr("警告：新文件已保存，但旧文件备份未能删除：%1").arg(backupPath));
     return true;
 }
 
-void TaskQueue::refreshTotalProgress(qint64 currentBytes)
+void TaskQueue::refreshTotalProgress()
 {
     qint64 estimatedCompleted = m_successfulBytes;
-    if (m_running && m_currentIndex >= 0 && m_currentIndex < m_tasks.size()) {
-        const FileTask &task = m_tasks[m_currentIndex];
-        if (task.status == TaskStatus::Encrypting || task.status == TaskStatus::Decrypting)
-            estimatedCompleted += qMin(task.inputSize, qMax<qint64>(0, currentBytes));
+    for (auto iterator = m_activeTasks.constBegin(); iterator != m_activeTasks.constEnd(); ++iterator) {
+        const FileTask &task = m_tasks[iterator.value().index];
+        estimatedCompleted = saturatedAdd(
+            estimatedCompleted, qMin(task.inputSize, qMax<qint64>(0, task.outputBytes)));
     }
+    int completedCount = 0;
+    for (const FileTask &task : m_tasks)
+        completedCount += isTerminal(task.status) ? 1 : 0;
     const int percent = m_totalBytes > 0
         ? qBound(0, static_cast<int>((static_cast<double>(estimatedCompleted)
                                       / static_cast<double>(m_totalBytes)) * 100.0), 100)
         : 0;
-    emit totalProgress(m_currentIndex >= 0 ? m_currentIndex + 1 : 0,
-                       m_tasks.size(), m_successfulBytes, m_totalBytes, percent);
+    emit totalProgress(completedCount, m_tasks.size(), m_successfulBytes, m_totalBytes, percent);
 }
 
 QString TaskQueue::friendlyFailure(const QString &diagnostic, int exitCode) const
 {
     const QString lower = diagnostic.toLower();
     if (lower.contains(QStringLiteral("too early")))
-        return QStringLiteral("尚未到达解锁时间。tle.exe 退出代码：%1").arg(exitCode);
+        return tr("尚未到达解锁时间。tle.exe 退出代码：%1").arg(exitCode);
     if (lower.contains(QStringLiteral("no space"))
         || lower.contains(QStringLiteral("disk full"))
         || lower.contains(QStringLiteral("not enough space"))) {
-        return QStringLiteral("输出磁盘可能已满。tle.exe 退出代码：%1").arg(exitCode);
+        return tr("输出磁盘可能已满。tle.exe 退出代码：%1").arg(exitCode);
     }
     if (lower.contains(QStringLiteral("network"))
         || lower.contains(QStringLiteral("connect"))
         || lower.contains(QStringLiteral("request"))) {
-        return QStringLiteral("无法访问 drand 网络，请检查网络连接和高级网络设置。tle.exe 退出代码：%1")
+        return tr("无法访问 drand 网络，请检查网络连接和高级网络设置。tle.exe 退出代码：%1")
             .arg(exitCode);
     }
     if (!diagnostic.trimmed().isEmpty())
-        return QStringLiteral("tle.exe 执行失败（退出代码 %1）：%2").arg(exitCode).arg(diagnostic.trimmed());
-    return QStringLiteral("tle.exe 执行失败，退出代码：%1").arg(exitCode);
+        return tr("tle.exe 执行失败（退出代码 %1）：%2").arg(exitCode).arg(diagnostic.trimmed());
+    return tr("tle.exe 执行失败，退出代码：%1").arg(exitCode);
 }

@@ -1,6 +1,7 @@
 #include "Utils.h"
 
 #include <QDir>
+#include <QCoreApplication>
 #include <QFileInfo>
 #include <QTemporaryFile>
 #include <QTimeZone>
@@ -8,6 +9,13 @@
 #include <cmath>
 
 namespace Utils {
+
+namespace {
+QString text(const char *source)
+{
+    return QCoreApplication::translate("Utils", source);
+}
+}
 
 QString formatBytes(qint64 bytes, int precision)
 {
@@ -29,20 +37,20 @@ QString formatBytes(qint64 bytes, int precision)
 QString formatRate(double bytesPerSecond)
 {
     if (!std::isfinite(bytesPerSecond) || bytesPerSecond < 0.0)
-        return QStringLiteral("计算中...");
-    return QStringLiteral("约 %1/s").arg(formatBytes(static_cast<qint64>(bytesPerSecond), 2));
+        return text("计算中...");
+    return text("约 %1/s").arg(formatBytes(static_cast<qint64>(bytesPerSecond), 2));
 }
 
 QString formatDuration(qint64 seconds)
 {
     if (seconds < 0)
-        return QStringLiteral("计算中...");
+        return text("计算中...");
     const qint64 hours = seconds / 3600;
     const qint64 minutes = (seconds % 3600) / 60;
     const qint64 remainingSeconds = seconds % 60;
     if (hours > 99) {
         const qint64 days = hours / 24;
-        return QStringLiteral("%1天 %2:%3:%4")
+        return text("%1天 %2:%3:%4")
             .arg(days)
             .arg(hours % 24, 2, 10, QLatin1Char('0'))
             .arg(minutes, 2, 10, QLatin1Char('0'))
@@ -57,15 +65,15 @@ QString formatDuration(qint64 seconds)
 QString taskStatusText(TaskStatus status)
 {
     switch (status) {
-    case TaskStatus::Pending: return QStringLiteral("等待中");
-    case TaskStatus::Encrypting: return QStringLiteral("正在加密");
-    case TaskStatus::Decrypting: return QStringLiteral("正在解密");
-    case TaskStatus::Success: return QStringLiteral("成功");
-    case TaskStatus::Failed: return QStringLiteral("失败");
-    case TaskStatus::Skipped: return QStringLiteral("已跳过");
-    case TaskStatus::Cancelled: return QStringLiteral("已取消");
+    case TaskStatus::Pending: return text("等待中");
+    case TaskStatus::Encrypting: return text("正在加密");
+    case TaskStatus::Decrypting: return text("正在解密");
+    case TaskStatus::Success: return text("成功");
+    case TaskStatus::Failed: return text("失败");
+    case TaskStatus::Skipped: return text("已跳过");
+    case TaskStatus::Cancelled: return text("已取消");
     }
-    return QStringLiteral("未知");
+    return text("未知");
 }
 
 QString outputPathFor(const QString &inputPath, TaskMode mode,
@@ -116,7 +124,7 @@ bool isPathWritableDirectory(const QString &path, QString *errorMessage)
     const QFileInfo info(path);
     if (!info.exists() || !info.isDir()) {
         if (errorMessage)
-            *errorMessage = QStringLiteral("输出目录不存在：%1").arg(path);
+            *errorMessage = text("输出目录不存在：%1").arg(path);
         return false;
     }
 
@@ -124,7 +132,7 @@ bool isPathWritableDirectory(const QString &path, QString *errorMessage)
     probe.setAutoRemove(true);
     if (!probe.open()) {
         if (errorMessage)
-            *errorMessage = QStringLiteral("输出目录不可写：%1\n%2").arg(path, probe.errorString());
+            *errorMessage = text("输出目录不可写：%1\n%2").arg(path, probe.errorString());
         return false;
     }
     return true;

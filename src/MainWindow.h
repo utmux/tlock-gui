@@ -9,6 +9,7 @@
 class HashWorker;
 class QCheckBox;
 class QCloseEvent;
+class QComboBox;
 class QDateTimeEdit;
 class QDragEnterEvent;
 class QDropEvent;
@@ -20,6 +21,7 @@ class QProcess;
 class QProgressBar;
 class QPushButton;
 class QRadioButton;
+class QSpinBox;
 class QTableWidget;
 class QThread;
 class QToolButton;
@@ -66,6 +68,7 @@ private:
     void chooseOutputDirectory();
     void applyQuickTime(int kind, qint64 value);
     void startBatch();
+    void cancelSelectedTask();
     bool createBatchTasks(QVector<FileTask> *tasks, QString *errorMessage);
     bool checkBatchDiskSpace(const QVector<FileTask> &tasks, QString *errorMessage) const;
     void setUiRunning(bool running);
@@ -110,6 +113,7 @@ private:
     QPushButton *m_tleBrowseButton = nullptr;
     QPushButton *m_tleTestButton = nullptr;
     QLabel *m_currentFileLabel = nullptr;
+    QLabel *m_activeCountLabel = nullptr;
     QLabel *m_currentProgressLabel = nullptr;
     QLabel *m_speedLabel = nullptr;
     QLabel *m_elapsedLabel = nullptr;
@@ -126,6 +130,8 @@ private:
     QToolButton *m_advancedToggle = nullptr;
     QWidget *m_advancedPanel = nullptr;
     QCheckBox *m_defaultNetworkCheck = nullptr;
+    QSpinBox *m_parallelSpin = nullptr;
+    QComboBox *m_languageCombo = nullptr;
     QLineEdit *m_networkEdit = nullptr;
     QLineEdit *m_chainEdit = nullptr;
     QToolButton *m_logToggle = nullptr;

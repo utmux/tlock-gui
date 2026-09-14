@@ -1,3 +1,4 @@
+#include "AppTranslator.h"
 #include "FileTask.h"
 #include "PowerManager.h"
 #include "TaskQueue.h"
@@ -59,6 +60,14 @@ int main(int argc, char *argv[])
     if (!QFileInfo(fakeTlePath).isFile())
         return fail(QStringLiteral("FakeTle does not exist"));
 
+    AppTranslator englishTranslator;
+    application.installTranslator(&englishTranslator);
+    if (Utils::taskStatusText(TaskStatus::Pending) != QStringLiteral("Pending")
+        || QCoreApplication::translate("MainWindow", "并行任务数：") != QStringLiteral("Parallel tasks:")) {
+        return fail(QStringLiteral("English translation"));
+    }
+    application.removeTranslator(&englishTranslator);
+
     QString powerError;
     if (!PowerManager::setKeepAwake(true, &powerError))
         return fail(QStringLiteral("Windows keep-awake request: %1").arg(powerError));
@@ -107,16 +116,22 @@ int main(int argc, char *argv[])
     settings.mode = TaskMode::Encrypt;
     settings.unlockTarget = QDateTime::currentDateTime().addSecs(600);
     settings.useDefaultNetwork = true;
+    settings.maxParallelTasks = 2;
 
     TaskQueue queue;
     bool timedOut = false;
     bool batchFinished = false;
     int existingPrompts = 0;
+    int peakActiveTasks = 0;
     QEventLoop loop;
     QObject::connect(&queue, &TaskQueue::existingTargetFound, &queue,
                      [&queue, &existingPrompts](int, const QString &) {
         ++existingPrompts;
         queue.resolveExistingTarget(TaskQueue::ExistingTargetDecision::Overwrite);
+    });
+    QObject::connect(&queue, &TaskQueue::activeCountChanged, &queue,
+                     [&peakActiveTasks](int active, int) {
+        peakActiveTasks = qMax(peakActiveTasks, active);
     });
     QObject::connect(&queue, &TaskQueue::batchFinished, &loop,
                      [&loop, &batchFinished](bool) {
@@ -139,10 +154,12 @@ int main(int argc, char *argv[])
     }
     if (existingPrompts != 1)
         return fail(QStringLiteral("overwrite prompt count"));
+    if (peakActiveTasks != 2)
+        return fail(QStringLiteral("parallel scheduler did not respect the configured limit"));
     if (queue.tasks().size() != 2
         || queue.tasks().at(0).status != TaskStatus::Success
         || queue.tasks().at(1).status != TaskStatus::Success) {
-        return fail(QStringLiteral("sequential task completion"));
+        return fail(QStringLiteral("parallel task completion"));
     }
     if (QFileInfo::exists(tasks.at(0).tempOutputPath) || QFileInfo::exists(tasks.at(1).tempOutputPath))
         return fail(QStringLiteral("part cleanup and rename"));
@@ -203,14 +220,20 @@ int main(int argc, char *argv[])
         return fail(QStringLiteral("expired target stops remaining encryption"));
     }
 
-    const QString cancelInput = QDir(specialDirectory).filePath(QStringLiteral("cancel-source.bin"));
-    if (!writePatternFile(cancelInput, 512, 'C'))
-        return fail(QStringLiteral("cancel input creation"));
-    FileTask cancelTask;
-    cancelTask.inputPath = cancelInput;
-    cancelTask.inputSize = QFileInfo(cancelInput).size();
-    cancelTask.finalOutputPath = QDir(specialDirectory).filePath(QStringLiteral("cancel-output.tle"));
-    cancelTask.tempOutputPath = cancelTask.finalOutputPath + QStringLiteral(".part");
+    QVector<FileTask> cancelTasks;
+    for (int index = 0; index < 3; ++index) {
+        const QString cancelInput = QDir(specialDirectory)
+            .filePath(QStringLiteral("cancel-source-%1.bin").arg(index));
+        if (!writePatternFile(cancelInput, 128, static_cast<char>('C' + index)))
+            return fail(QStringLiteral("cancel input creation"));
+        FileTask cancelTask;
+        cancelTask.inputPath = cancelInput;
+        cancelTask.inputSize = QFileInfo(cancelInput).size();
+        cancelTask.finalOutputPath = QDir(specialDirectory)
+            .filePath(QStringLiteral("cancel-output-%1.tle").arg(index));
+        cancelTask.tempOutputPath = cancelTask.finalOutputPath + QStringLiteral(".part");
+        cancelTasks.append(cancelTask);
+    }
 
     TaskQueue cancelQueue;
     QEventLoop cancelLoop;
@@ -222,17 +245,23 @@ int main(int argc, char *argv[])
         cancelTimedOut = true;
         cancelLoop.quit();
     });
-    cancelQueue.start({cancelTask}, settings);
+    BatchSettings cancelSettings = settings;
+    cancelSettings.maxParallelTasks = 3;
+    cancelQueue.start(cancelTasks, cancelSettings);
     cancelLoop.exec();
-    if (cancelTimedOut || cancelQueue.isRunning()
-        || cancelQueue.tasks().constFirst().status != TaskStatus::Cancelled
-        || QFileInfo::exists(cancelTask.tempOutputPath)
-        || !verifyPatternFile(cancelInput, 512, 'C')) {
+    bool cancellationClean = !cancelTimedOut && !cancelQueue.isRunning();
+    for (int index = 0; index < cancelTasks.size(); ++index) {
+        cancellationClean = cancellationClean
+            && cancelQueue.tasks().at(index).status == TaskStatus::Cancelled
+            && !QFileInfo::exists(cancelTasks.at(index).tempOutputPath)
+            && verifyPatternFile(cancelTasks.at(index).inputPath, 128, static_cast<char>('C' + index));
+    }
+    if (!cancellationClean) {
         cancelQueue.forceShutdown();
-        return fail(QStringLiteral("cancel lifecycle, part cleanup, or input preservation"));
+        return fail(QStringLiteral("parallel stop lifecycle, part cleanup, or input preservation"));
     }
 
-    QTextStream(stdout) << "PASS: utils, special paths, sequential queue, .part rename, safe overwrite, "
-                           "stale part protection, expired target stop, cancellation cleanup\n";
+    QTextStream(stdout) << "PASS: utils, special paths, parallel queue, .part rename, safe overwrite, "
+                           "stale part protection, expired target stop, parallel cancellation cleanup\n";
     return 0;
 }
