@@ -1,0 +1,3 @@
+TLockGUI official tle.exe integration test.
+This file is intentionally small; production data stays in tle.exe, never in GUI memory.
+中文路径与空格参数测试。

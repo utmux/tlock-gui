@@ -1,0 +1,14 @@
+/build/
+/build-*/
+/dist/
+/integration-output/
+/artifacts/
+*.part
+*.tle
+CMakeUserPresets.json
+CMakeLists.txt.user*
+*.user
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
