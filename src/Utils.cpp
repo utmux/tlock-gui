@@ -3,14 +3,19 @@
 #include <QDir>
 #include <QCoreApplication>
 #include <QFileInfo>
+#include <QRegularExpression>
 #include <QTemporaryFile>
 #include <QTimeZone>
 
 #include <cmath>
+#include <limits>
 
 namespace Utils {
 
 namespace {
+constexpr qint64 quicknetGenesisTime = 1692803367LL;
+constexpr qint64 quicknetPeriodSeconds = 3LL;
+
 QString text(const char *source)
 {
     return QCoreApplication::translate("Utils", source);
@@ -136,6 +141,45 @@ bool isPathWritableDirectory(const QString &path, QString *errorMessage)
         return false;
     }
     return true;
+}
+
+bool parseDrandTooEarlyRounds(const QString &diagnostic, qint64 *expectedRound,
+                              qint64 *currentRound)
+{
+    static const QRegularExpression expression(
+        QStringLiteral("expected\\s+round\\s+(\\d+)\\s*>\\s*(\\d+)\\s+current\\s+round"),
+        QRegularExpression::CaseInsensitiveOption);
+    const QRegularExpressionMatch match = expression.match(diagnostic);
+    if (!match.hasMatch())
+        return false;
+
+    bool expectedOk = false;
+    bool currentOk = false;
+    const qint64 expected = match.captured(1).toLongLong(&expectedOk);
+    const qint64 current = match.captured(2).toLongLong(&currentOk);
+    if (!expectedOk || !currentOk || expected <= 0 || current <= 0 || expected <= current)
+        return false;
+    if (expectedRound)
+        *expectedRound = expected;
+    if (currentRound)
+        *currentRound = current;
+    return true;
+}
+
+QDateTime quicknetRoundTimeUtc(qint64 round)
+{
+    if (round <= 0
+        || round - 1 > (std::numeric_limits<qint64>::max() - quicknetGenesisTime)
+            / quicknetPeriodSeconds) {
+        return {};
+    }
+    return QDateTime::fromSecsSinceEpoch(
+        quicknetGenesisTime + (round - 1) * quicknetPeriodSeconds, QTimeZone::UTC);
+}
+
+QString quicknetChainHash()
+{
+    return QStringLiteral("52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971");
 }
 
 } // namespace Utils

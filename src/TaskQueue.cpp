@@ -572,8 +572,34 @@ void TaskQueue::refreshTotalProgress()
 QString TaskQueue::friendlyFailure(const QString &diagnostic, int exitCode) const
 {
     const QString lower = diagnostic.toLower();
-    if (lower.contains(QStringLiteral("too early")))
-        return tr("尚未到达解锁时间。tle.exe 退出代码：%1").arg(exitCode);
+    if (lower.contains(QStringLiteral("too early"))) {
+        qint64 expectedRound = 0;
+        qint64 currentRound = 0;
+        if (Utils::parseDrandTooEarlyRounds(diagnostic, &expectedRound, &currentRound)) {
+            const qint64 remainingRounds = expectedRound - currentRound;
+            const bool knownQuicknet = m_settings.useDefaultNetwork
+                || m_settings.chain.trimmed().compare(Utils::quicknetChainHash(), Qt::CaseInsensitive) == 0;
+            if (knownQuicknet) {
+                const QDateTime unlockTime = Utils::quicknetRoundTimeUtc(expectedRound).toLocalTime();
+                const qint64 remainingSeconds = remainingRounds > std::numeric_limits<qint64>::max() / 3
+                    ? std::numeric_limits<qint64>::max() : remainingRounds * 3;
+                if (unlockTime.isValid()) {
+                    return tr("尚未到达解锁轮次。预计可解密时间：%1（%2）；按当前轮次估计还需约 %3。"
+                              "目标轮次：%4，当前轮次：%5。drand 节点可能有数秒延迟，请到时稍后重试。")
+                        .arg(unlockTime.toString(QStringLiteral("yyyy-MM-dd HH:mm:ss")))
+                        .arg(Utils::timeZoneDescription(unlockTime))
+                        .arg(Utils::formatDuration(remainingSeconds))
+                        .arg(expectedRound)
+                        .arg(currentRound);
+                }
+            }
+            return tr("尚未到达解锁轮次。目标轮次：%1，当前轮次：%2，还差 %3 轮。"
+                      "当前使用的网络周期未知，无法准确换算本地解密时间。")
+                .arg(expectedRound).arg(currentRound).arg(remainingRounds);
+        }
+        return tr("尚未到达解锁时间，tle.exe 未返回可换算的目标轮次。请稍后重试。退出代码：%1")
+            .arg(exitCode);
+    }
     if (lower.contains(QStringLiteral("no space"))
         || lower.contains(QStringLiteral("disk full"))
         || lower.contains(QStringLiteral("not enough space"))) {

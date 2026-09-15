@@ -63,7 +63,12 @@ int main(int argc, char *argv[])
     AppTranslator englishTranslator;
     application.installTranslator(&englishTranslator);
     if (Utils::taskStatusText(TaskStatus::Pending) != QStringLiteral("Pending")
-        || QCoreApplication::translate("MainWindow", "并行任务数：") != QStringLiteral("Parallel tasks:")) {
+        || QCoreApplication::translate("MainWindow", "并行任务数：") != QStringLiteral("Parallel tasks:")
+        || QCoreApplication::translate(
+               "TaskQueue",
+               "尚未到达解锁轮次。预计可解密时间：%1（%2）；按当前轮次估计还需约 %3。"
+               "目标轮次：%4，当前轮次：%5。drand 节点可能有数秒延迟，请到时稍后重试。")
+               .startsWith(QStringLiteral("The unlock round has not arrived.")) == false) {
         return fail(QStringLiteral("English translation"));
     }
     application.removeTranslator(&englishTranslator);
@@ -83,6 +88,22 @@ int main(int argc, char *argv[])
     if (!Utils::outputPathFor(QStringLiteral("C:/a/data.bin"), TaskMode::Decrypt, true, {})
              .endsWith(QStringLiteral("data.bin.decrypted"))) {
         return fail(QStringLiteral("fallback decrypt output naming"));
+    }
+    qint64 expectedRound = 0;
+    qint64 currentRound = 0;
+    if (!Utils::parseDrandTooEarlyRounds(
+            QStringLiteral("too early to decrypt: expected round 32194618 > 32194608 current round"),
+            &expectedRound, &currentRound)
+        || expectedRound != 32194618 || currentRound != 32194608
+        || Utils::parseDrandTooEarlyRounds(QStringLiteral("too early to decrypt"), nullptr, nullptr)) {
+        return fail(QStringLiteral("drand too-early round parsing"));
+    }
+    if (Utils::quicknetRoundTimeUtc(1).toSecsSinceEpoch() != 1692803367LL
+        || Utils::quicknetRoundTimeUtc(11).toSecsSinceEpoch() != 1692803397LL
+        || Utils::quicknetRoundTimeUtc(0).isValid()
+        || Utils::quicknetChainHash()
+            != QStringLiteral("52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971")) {
+        return fail(QStringLiteral("quicknet round time conversion"));
     }
 
     QTemporaryDir temporaryDirectory;

@@ -16,5 +16,9 @@ QString outputPathFor(const QString &inputPath, TaskMode mode,
 QString normalizedPathKey(const QString &path);
 QString timeZoneDescription(const QDateTime &dateTime = QDateTime::currentDateTime());
 bool isPathWritableDirectory(const QString &path, QString *errorMessage = nullptr);
+bool parseDrandTooEarlyRounds(const QString &diagnostic, qint64 *expectedRound,
+                              qint64 *currentRound);
+QDateTime quicknetRoundTimeUtc(qint64 round);
+QString quicknetChainHash();
 
 } // namespace Utils

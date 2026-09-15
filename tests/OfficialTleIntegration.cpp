@@ -129,7 +129,9 @@ int main(int argc, char *argv[])
     if (early.timedOut)
         return fail(QStringLiteral("early decryption timed out"));
     const bool earlyRejected = early.task.status == TaskStatus::Failed
-        && early.task.errorMessage.contains(QStringLiteral("尚未到达解锁时间"));
+        && early.task.errorMessage.contains(QStringLiteral("预计可解密时间："))
+        && early.task.errorMessage.contains(QStringLiteral("目标轮次："))
+        && early.task.errorMessage.contains(QStringLiteral("当前轮次："));
     if (!earlyRejected && QDateTime::currentDateTime() < target)
         return fail(QStringLiteral("early decryption was not rejected as too early"));
     if (QFileInfo::exists(decryptTask.tempOutputPath))
@@ -155,6 +157,7 @@ int main(int argc, char *argv[])
     }
 
     QTextStream(stdout) << "PASS: official tle.exe metadata-compatible arguments, 30s lock, "
-                           "early rejection, mature decrypt, Unicode/special path, safe .part output\n";
+                           "detailed early-decrypt estimate, mature decrypt, Unicode/special path, "
+                           "safe .part output\n";
     return 0;
 }

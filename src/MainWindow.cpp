@@ -40,6 +40,7 @@
 #include <QStandardPaths>
 #include <QStorageInfo>
 #include <QSpinBox>
+#include <QStringList>
 #include <QTableWidget>
 #include <QThread>
 #include <QTimeZone>
@@ -1013,6 +1014,23 @@ void MainWindow::handleBatchFinished(bool stopped)
     QString message = tr("批处理已%1。\n成功：%2\n失败：%3\n跳过：%4\n取消：%5")
         .arg(stopped ? tr("停止") : tr("完成"))
         .arg(success).arg(failed).arg(skipped).arg(cancelled);
+    QStringList failureDetails;
+    for (const FileTask &task : m_files) {
+        if (task.status != TaskStatus::Failed || task.errorMessage.trimmed().isEmpty())
+            continue;
+        failureDetails.append(QStringLiteral("• %1\n  %2")
+                                  .arg(QFileInfo(task.inputPath).fileName(), task.errorMessage.trimmed()));
+        if (failureDetails.size() == 3)
+            break;
+    }
+    if (!failureDetails.isEmpty()) {
+        message += tr("\n\n失败详情（最多显示 3 项）：\n%1")
+                       .arg(failureDetails.join(QLatin1Char('\n')));
+        if (failed > failureDetails.size()) {
+            message += tr("\n另有 %1 个失败任务，请查看日志或将鼠标停在表格“状态”列上查看详情。")
+                           .arg(failed - failureDetails.size());
+        }
+    }
     if (selectedMode() == TaskMode::Encrypt && success > 0) {
         message += tr("\n\n请确认密文已经正确保存和备份后，再自行决定是否删除原始文件。"
                       "TLockGUI 不会删除任何输入文件。");
