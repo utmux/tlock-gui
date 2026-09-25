@@ -71,6 +71,7 @@ private:
     void cancelSelectedTask();
     bool createBatchTasks(QVector<FileTask> *tasks, QString *errorMessage);
     bool checkBatchDiskSpace(const QVector<FileTask> &tasks, QString *errorMessage) const;
+    bool chooseParallelismForStorage(const QVector<FileTask> &tasks, int *parallelism);
     void setUiRunning(bool running);
     void handleBatchFinished(bool stopped);
     void cancelScheduledShutdown();

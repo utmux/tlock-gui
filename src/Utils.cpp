@@ -4,11 +4,20 @@
 #include <QCoreApplication>
 #include <QFileInfo>
 #include <QRegularExpression>
+#include <QStorageInfo>
 #include <QTemporaryFile>
 #include <QTimeZone>
 
 #include <cmath>
 #include <limits>
+
+#ifdef Q_OS_WIN
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <winioctl.h>
+#endif
 
 namespace Utils {
 
@@ -180,6 +189,53 @@ QDateTime quicknetRoundTimeUtc(qint64 round)
 QString quicknetChainHash()
 {
     return QStringLiteral("52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971");
+}
+
+StorageMediaType storageMediaTypeForPath(const QString &path, QString *volumeRoot)
+{
+    if (volumeRoot)
+        volumeRoot->clear();
+    if (path.trimmed().isEmpty())
+        return StorageMediaType::Unknown;
+
+    const QStorageInfo storage(path);
+    const QString root = QDir::fromNativeSeparators(storage.rootPath());
+    if (volumeRoot)
+        *volumeRoot = QDir::toNativeSeparators(root);
+
+#ifdef Q_OS_WIN
+    if (!storage.isValid() || !storage.isReady() || root.size() < 2
+        || !root.at(0).isLetter() || root.at(1) != QLatin1Char(':')) {
+        return StorageMediaType::Unknown;
+    }
+
+    const QString devicePath = QStringLiteral("\\\\.\\") + root.left(2);
+    const HANDLE volume = CreateFileW(
+        reinterpret_cast<LPCWSTR>(devicePath.utf16()), 0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, 0, nullptr);
+    if (volume == INVALID_HANDLE_VALUE)
+        return StorageMediaType::Unknown;
+
+    STORAGE_PROPERTY_QUERY query{};
+    query.PropertyId = StorageDeviceSeekPenaltyProperty;
+    query.QueryType = PropertyStandardQuery;
+    DEVICE_SEEK_PENALTY_DESCRIPTOR descriptor{};
+    DWORD bytesReturned = 0;
+    const BOOL ok = DeviceIoControl(
+        volume, IOCTL_STORAGE_QUERY_PROPERTY,
+        &query, sizeof(query), &descriptor, sizeof(descriptor),
+        &bytesReturned, nullptr);
+    CloseHandle(volume);
+
+    if (!ok || bytesReturned < sizeof(descriptor))
+        return StorageMediaType::Unknown;
+    return descriptor.IncursSeekPenalty
+        ? StorageMediaType::Rotational : StorageMediaType::SolidState;
+#else
+    Q_UNUSED(storage);
+    return StorageMediaType::Unknown;
+#endif
 }
 
 } // namespace Utils

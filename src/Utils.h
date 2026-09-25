@@ -7,6 +7,12 @@
 
 namespace Utils {
 
+enum class StorageMediaType {
+    Unknown,
+    SolidState,
+    Rotational
+};
+
 QString formatBytes(qint64 bytes, int precision = 2);
 QString formatRate(double bytesPerSecond);
 QString formatDuration(qint64 seconds);
@@ -20,5 +26,6 @@ bool parseDrandTooEarlyRounds(const QString &diagnostic, qint64 *expectedRound,
                               qint64 *currentRound);
 QDateTime quicknetRoundTimeUtc(qint64 round);
 QString quicknetChainHash();
+StorageMediaType storageMediaTypeForPath(const QString &path, QString *volumeRoot = nullptr);
 
 } // namespace Utils

@@ -64,6 +64,10 @@ int main(int argc, char *argv[])
     application.installTranslator(&englishTranslator);
     if (Utils::taskStatusText(TaskStatus::Pending) != QStringLiteral("Pending")
         || QCoreApplication::translate("MainWindow", "并行任务数：") != QStringLiteral("Parallel tasks:")
+        || QCoreApplication::translate("MainWindow", "检测到机械硬盘输入")
+            != QStringLiteral("HDD input detected")
+        || QCoreApplication::translate("MainWindow", "使用 1（推荐）")
+            != QStringLiteral("Use 1 (recommended)")
         || QCoreApplication::translate(
                "TaskQueue",
                "尚未到达解锁轮次。预计可解密时间：%1（%2）；按当前轮次估计还需约 %3。"
@@ -81,6 +85,13 @@ int main(int argc, char *argv[])
 
     if (Utils::formatBytes(10737418240LL) != QStringLiteral("10.00 GiB"))
         return fail(QStringLiteral("64-bit size formatting"));
+    QString executableVolume;
+    if (Utils::storageMediaTypeForPath(fakeTlePath, &executableVolume)
+            == Utils::StorageMediaType::Unknown
+        || executableVolume.isEmpty()
+        || Utils::storageMediaTypeForPath({}, nullptr) != Utils::StorageMediaType::Unknown) {
+        return fail(QStringLiteral("Windows storage media detection"));
+    }
     if (!Utils::outputPathFor(QStringLiteral("C:/a/movie.mp4.tle"), TaskMode::Decrypt, true, {})
              .endsWith(QStringLiteral("movie.mp4"))) {
         return fail(QStringLiteral("decrypt output naming"));

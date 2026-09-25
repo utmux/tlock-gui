@@ -20,6 +20,7 @@
 #include <QFileInfo>
 #include <QFormLayout>
 #include <QGroupBox>
+#include <QHash>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QKeyEvent>
@@ -292,7 +293,7 @@ void MainWindow::buildUi()
     m_parallelSpin = new QSpinBox(m_advancedPanel);
     m_parallelSpin->setRange(1, 8);
     m_parallelSpin->setValue(2);
-    m_parallelSpin->setToolTip(tr("同时运行的 tle.exe 数量。机械硬盘建议 1，SSD 可从 2 开始尝试。"));
+    m_parallelSpin->setToolTip(tr("同时运行的 tle.exe 数量。默认 2；批次包含机械硬盘输入且数值大于 1 时，开始前会建议改为 1。"));
     m_networkEdit = new QLineEdit(defaultNetwork, m_advancedPanel);
     m_chainEdit = new QLineEdit(defaultChain, m_advancedPanel);
     advancedLayout->addRow(m_defaultNetworkCheck);
@@ -793,6 +794,10 @@ void MainWindow::startBatch()
         return;
     }
 
+    int effectiveParallelism = m_parallelSpin->value();
+    if (!chooseParallelismForStorage(tasks, &effectiveParallelism))
+        return;
+
     if (m_shutdownAfterCheck->isChecked()) {
         const auto answer = QMessageBox::warning(
             this, tr("确认完成后关机"),
@@ -815,7 +820,7 @@ void MainWindow::startBatch()
     settings.useDefaultNetwork = m_defaultNetworkCheck->isChecked();
     settings.network = m_networkEdit->text().trimmed();
     settings.chain = m_chainEdit->text().trimmed();
-    settings.maxParallelTasks = m_parallelSpin->value();
+    settings.maxParallelTasks = effectiveParallelism;
     appendLog(tr("开始并行批处理，共 %1 个文件，并发上限 %2，总输入大小 %3。")
                   .arg(tasks.size()).arg(settings.maxParallelTasks).arg(Utils::formatBytes([&tasks]() {
                       qint64 total = 0;
@@ -824,6 +829,64 @@ void MainWindow::startBatch()
                       return total;
                   }())));
     m_queue->start(tasks, settings);
+}
+
+bool MainWindow::chooseParallelismForStorage(const QVector<FileTask> &tasks, int *parallelism)
+{
+    if (!parallelism || *parallelism <= 1 || tasks.size() <= 1)
+        return true;
+
+    QHash<QString, int> taskCountsByVolume;
+    QHash<QString, QString> displayRootByVolume;
+    QStringList volumeOrder;
+    QStringList rotationalVolumes;
+    for (const FileTask &task : tasks) {
+        QString root;
+        if (Utils::storageMediaTypeForPath(task.inputPath, &root)
+            != Utils::StorageMediaType::Rotational || root.isEmpty()) {
+            continue;
+        }
+        const QString key = root.toCaseFolded();
+        if (!taskCountsByVolume.contains(key)) {
+            volumeOrder.append(key);
+            displayRootByVolume.insert(key, root);
+        }
+        taskCountsByVolume[key] += 1;
+    }
+    for (const QString &key : volumeOrder) {
+        if (taskCountsByVolume.value(key) > 1)
+            rotationalVolumes.append(displayRootByVolume.value(key));
+    }
+    if (rotationalVolumes.isEmpty())
+        return true;
+
+    QMessageBox box(QMessageBox::Warning, tr("检测到机械硬盘输入"),
+                    tr("Windows 检测到以下输入盘为机械硬盘：\n%1")
+                        .arg(rotationalVolumes.join(tr("、"))),
+                    QMessageBox::NoButton, this);
+    box.setInformativeText(
+        tr("当前并发为 %1。多个 tle.exe 同时读取同一机械硬盘会导致磁头来回寻道，"
+           "总速度通常更慢。建议本批次改为并发 1；SSD/NVMe 默认仍为 2。")
+            .arg(*parallelism));
+    QPushButton *useOne = box.addButton(tr("使用 1（推荐）"), QMessageBox::AcceptRole);
+    QPushButton *keepCurrent = box.addButton(tr("保持 %1").arg(*parallelism), QMessageBox::ActionRole);
+    QPushButton *cancel = box.addButton(QMessageBox::Cancel);
+    box.setDefaultButton(useOne);
+    box.setEscapeButton(cancel);
+    box.exec();
+
+    if (box.clickedButton() == cancel)
+        return false;
+    if (box.clickedButton() == useOne) {
+        *parallelism = 1;
+        appendLog(tr("检测到机械硬盘输入：%1。本批次并发已调整为 1。")
+                      .arg(rotationalVolumes.join(tr("、"))));
+    } else if (box.clickedButton() == keepCurrent) {
+        appendLog(tr("检测到机械硬盘输入：%1。用户选择保留并发 %2。")
+                      .arg(rotationalVolumes.join(tr("、")))
+                      .arg(*parallelism));
+    }
+    return true;
 }
 
 void MainWindow::cancelSelectedTask()
